@@ -14,9 +14,22 @@
 
 P3_VmStats  P3_vmStats;
 
+int lockId;
+int condId;
+
+//TODO: What goes into the fault struct?
+typedef struct fault{
+
+    fault *next
+} fault;
+
+fault *faultQueueHead;
+USLOSS_PTE *tables[P1_MAX_PROC];
+
 static void
 FaultHandler(int type, void *arg)
 {
+    int rc;
     /*******************
 
     if it's an access fault (USLOSS_MmuGetCause)
@@ -28,12 +41,30 @@ FaultHandler(int type, void *arg)
         terminate the process if necessary
 
     *********************/
-
+    if(USLOSS_MmuGetCause() == P3_ACCESS_VIOLATION){
+        // terminate proccess
+        return P3_OUT_OF_SWAP;
+    }
+    else{
+        rc = P1_Lock(lockId);
+        assert(rc == P1_SUCCESS);
+        fault *newFault = (fault *)malloc(sizeof(fault));
+        newFault->next = faultQueueHead->next;
+        // TODO: add fault information
+        faultQueueHead->next = newFault;
+        rc = P1_Signal(condId);
+        assert(rc == P1_SUCCESS);
+        rc = P1_Wait(condId);
+        assert(rc == P1_SUCCESS);
+        // TODO: terminate if needed
+    }
 }
 
 static int 
 Pager(void *arg)
 {
+    int pageSize, numPages, numFrames, mode;
+    void *vmRegion, pmAddr;
     /*******************
 
     loop until P3_VmShutdown is called
@@ -50,18 +81,72 @@ Pager(void *arg)
        unblock faulting process
 
     *********************/
+    while(1){
+        rc = P1_Wait(condId);
+        assert(rc == P1_SUCCESS);
+        // if process does not have page table
+        if(tables[P1_GetPid()] == NULL){
+            printf("Process does not have a page table\n");
+            USLOSS_Abort();
+        }
+        rc = USLOSS_MmuGetConfig(&vmRegion, &pmAddr, &pageSize, &numPages, &numFrames, &mode);
+        assert(rc == USLOSS_MMU_OK);
+        // TODO: find page number
+        rc = P3PageFaultResolve(P1_GetPid(), );
+        if(rc == P3_OUT_OF_SWAP){
+
+        }
+        else{
+            if(rc == P3_NOT_IMPLEMENTED){
+                
+            }
+        }
+    }
     return 0;
 }
 
 int
 P3_VmInit(int unused, int pages, int frames, int pagers)
 {
+    int rc;
+    int i;
+    // check pager number
+    if(pagers != P3_MAX_PAGERS){
+        return P3_INVALID_NUM_PAGERS;
+    }
     // zero P3_vmStats
+    // NOTE: Values might not equal zero
+    P3_VmStats->pages = pages;
+    P3_VmStats->frames = frames;
+    P3_VmStats->blocks = 0;
+    P3_VmStats->freeFrames = 0;
+    P3_VmStats->freeBlocks = 0
+    P3_VmStats->faults = 0;
+    P3_VmStats->newPages = 0;
+    P3_VmStats->pageIns = 0;
+    P3_VmStats->pageOuts = 0;
+    P3_VmStats->replaced = 0;
     // initialize fault queue, lock, and condition variable
+    faultQueueHead = (fault *)malloc(sizeof(fault));
+    faultQueueHead->next = NULL;
+    rc = P1_CreateLock("lock", &lockId);
+    assert(rc == P1_SUCCESS);
+    rc = P1_CreateCond("condition", lockId, &condId);
+    assert(rc == P1_SUCCESS);
+    // Set tables to NULL
+    for(i = 0; i < P1_MAX_PROC; i++){
+        tables[i] = NULL;
+    }
+    //TODO: figure out parameters for this function
+    // NOTE: numMaps is not used for Page Tables
+    USLOSS_MmuInit(0, pages, frames, USLOSS_MMU_MODE_PAGETABLE);
     // call P3FrameInit
+    P3FrameInit(pages, frames);
     // call P3SwapInit
+    P3SwapInit(pages, frames);
     // fork pager
-
+    // TODO: might need fix parameters
+    rc = P1_Fork("pager", Pager, void, P1_MAX_STACKSIZE, P3_PAGER_PRIORITY, P1_GetPid());
     USLOSS_IntVec[USLOSS_MMU_INT] = FaultHandler;
     return P1_SUCCESS;
 }
@@ -88,9 +173,12 @@ P3_FreePageTable(int pid)
 }
 
 int
-P3PageTableGet(PID pid, USLOSS_PTE **table)
+P3PageTableGet(int pid, USLOSS_PTE **table)
 {
-    *table = NULL;
+    if(pid >= P1_MAX_PROC){
+        return P1_INVALID_PID;
+    }
+    *table = tables[pid];
     return P1_SUCCESS;
 }
 
