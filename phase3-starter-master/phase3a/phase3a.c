@@ -24,7 +24,7 @@ int initCalled;
 typedef struct fault{
     int page;
     int pid;
-    fault *next;
+    struct fault *next;
 } fault;
 
 fault *faultQueueHead;
@@ -47,9 +47,10 @@ FaultHandler(int type, void *arg)
         terminate the process if necessary
 
     *********************/
-    if(USLOSS_MmuGetCause() == P3_ACCESS_VIOLATION){
+   // NOTE call P2_Terminate according to post @638
+    if(USLOSS_MmuGetCause() == USLOSS_MMU_ACCESS){
         // terminate proccess
-        return P3_OUT_OF_SWAP;
+        P2_Terminate(P3_ACCESS_VIOLATION);
     }
     else{
         rc = P1_Lock(lockId);
@@ -87,10 +88,11 @@ Pager(void *arg)
 
     *********************/
     fault *currFault;
-    USLOSS_PTE *currPTE;
+    USLOSS_PTE currPTE;
     int currPage;
     int currPid;
     int frame;
+    int rc;
     while(1){
         rc = P1_Wait(condId);
         assert(rc == P1_SUCCESS);
@@ -105,7 +107,7 @@ Pager(void *arg)
         // if process does not have page table
         if(tables[currPid] == NULL){
             printf("Process does not have a page table\n");
-            USLOSS_Abort();
+            USLOSS_Abort(0);    // NOTE: passed in 0
         }
         rc = P3PageFaultResolve(currPid, currPage, &frame);
         if(rc == P3_OUT_OF_SWAP){
@@ -113,10 +115,10 @@ Pager(void *arg)
         }
         else{
             if(rc == P3_NOT_IMPLEMENTED){
-                frame = page;
+                frame = currPage;    // NOTE: was page but page didnt exist
             }
-            currPTE->frame = frame;
-            currPTE->incore = 1;
+            currPTE.frame = frame;
+            currPTE.incore = 1;
         }
         rc = P1_Signal(condId);
         assert(rc == P1_SUCCESS);
@@ -128,7 +130,8 @@ int
 P3_VmInit(int unused, int pages, int frames, int pagers)
 {
     int numPages, numFrames, mode;
-    void *vmRegion, pmAddr;
+    void *vmRegion;
+    void *pmAddr;
     int rc;
     int i;
     int pid;
@@ -138,87 +141,117 @@ P3_VmInit(int unused, int pages, int frames, int pagers)
     }
     // zero P3_vmStats
     // TODO: fix values
-    P3_vmStats->pages = pages;
-    P3_vmStats->frames = frames;
-    P3_vmStats->blocks = 0;
-    P3_vmStats->freeFrames = frames;
-    P3_vmStats->freeBlocks = 0;
-    P3_vmStats->faults = 0;
-    P3_vmStats->newPages = 0;
-    P3_vmStats->pageIns = 0;
-    P3_vmStats->pageOuts = 0;
-    P3_vmStats->replaced = 0;
+    P3_vmStats.pages = pages;
+    P3_vmStats.frames = frames;
+    P3_vmStats.blocks = 0;
+    P3_vmStats.freeFrames = frames;
+    P3_vmStats.freeBlocks = 0;
+    P3_vmStats.faults = 0;
+    P3_vmStats.newPages = 0;
+    P3_vmStats.pageIns = 0;
+    P3_vmStats.pageOuts = 0;
+    P3_vmStats.replaced = 0;
+
     // initialize fault queue, lock, and condition variable
     faultQueueHead = (fault *)malloc(sizeof(fault));
     faultQueueHead->next = NULL;
     faultQueueHead->pid = -1;
     faultQueueHead->page = -1;
-    rc = P1_CreateLock("lock", &lockId);
+    rc = P1_LockCreate("lock", &lockId);
     assert(rc == P1_SUCCESS);
-    rc = P1_CreateCond("condition", lockId, &condId);
+    rc = P1_CondCreate("condition", lockId, &condId);
     assert(rc == P1_SUCCESS);
     // Set tables to NULL
     for(i = 0; i < P1_MAXPROC; i++){
         tables[i] = NULL;
     }
-    USLOSS_MmuInit(unused, pages, frames, USLOSS_MMU_MODE_PAGETABLE);
+    rc = USLOSS_MmuInit(unused, pages, frames, USLOSS_MMU_MODE_PAGETABLE);
+    assert(rc == USLOSS_MMU_OK);
+
     // call P3FrameInit
-    P3FrameInit(pages, frames);
+    rc = P3FrameInit(pages, frames);
+    assert(rc == P1_SUCCESS);
     // call P3SwapInit
-    P3SwapInit(pages, frames);
+    rc = P3SwapInit(pages, frames);
+    assert(rc == P1_SUCCESS);
 
     rc = USLOSS_MmuGetConfig(&vmRegion, &pmAddr, &pageSize, &numPages, &numFrames, &mode);
     assert(rc == USLOSS_MMU_OK);
     // fork pager
-    // TODO: might need fix parameters
+    // TODO: might need fix parameters (changed STACK param @627)
     initCalled = 1;
-    rc = P1_Fork("pager", Pager, NULL, P1_MAX_STACKSIZE, P3_PAGER_PRIORITY, &pid);
+    rc = P1_Fork("pager", Pager, NULL,2*USLOSS_MIN_STACK, P3_PAGER_PRIORITY, &pid);
+    assert(rc == P1_SUCCESS);
+    
     USLOSS_IntVec[USLOSS_MMU_INT] = FaultHandler;
     return P1_SUCCESS;
 }
 
+// NOTE: moved print inside (instruction say does nothing unless initcalled)
+// shut down process edited. @631
 void
 P3_VmShutdown(void)
 {
-    // cause pager to quit
-    if(initCalled == 0) return NULL;
-    
-    P3_PrintStats(&P3_vmStats);
+    int rc = 0;
+    // cause pager to quit and waits for it to do so
+    if(initCalled == 0){
+        rc = USLOSS_MmuDone();
+        while(rc == 0);                 // NOTE: Wait may not work
+        P3_PrintStats(&P3_vmStats);
+    }
 }
 
 USLOSS_PTE *
 P3_AllocatePageTable(int pid)
 {
+    // NOTE: init these (num pages was not declared)
+    int numPages, numFrames, mode;
+    void *vmRegion;
+    void *pmAddr;
+    int rc;
     int i;
+
     USLOSS_PTE  *table = NULL;
     if(initCalled == 1){
+        // NOTE: Error USLOSS_MMU_ERR_OFF (mmu is not enabled)
+        rc = USLOSS_MmuGetConfig(&vmRegion, &pmAddr, &pageSize, &numPages, &numFrames, &mode);
+
+        assert(rc == USLOSS_MMU_OK);
         table = (USLOSS_PTE *) malloc(sizeof(USLOSS_PTE) * numPages);
         tables[pid] = table;
         for(i = 0; i < numPages; i++){
-            table[i]->incore = 0;
-            table[i]->read = 1;
-            table[i]->write = 1;
-            table[i]->frame = 0;
+            table[i].incore = 0;
+            table[i].read = 1;
+            table[i].write = 1;
+            table[i].frame = 0;
         }
     }
     return table;
 }
 
+// NOTE: removed null from return. No return value
 void
 P3_FreePageTable(int pid)
 {
-    int i;
+    // NOTE: added inits and getter
+    int numPages, numFrames, mode;
+    void *vmRegion;
+    void *pmAddr;
     int rc;
+    rc = USLOSS_MmuGetConfig(&vmRegion, &pmAddr, &pageSize, &numPages, &numFrames, &mode);
+    assert(rc == USLOSS_MMU_OK);
+
+
     USLOSS_PTE  *table = tables[pid];
-    if(initCalled != 1) return NULL;
+    if(initCalled != 1){
+        return;
+    }
     rc = P3FrameFreeAll(pid);
     assert(rc == P1_SUCCESS);
     rc = P3SwapFreeAll(pid);
     assert(rc == P1_SUCCESS);
-    // NOTE: If doesn't work let garbage collector take care of it
-    for(i = 0; i < numPages; i++){
-        free(table[i]);
-    }
+    // NOTE: removed loop (throwing error on table[i])
+    free(table);
     tables[pid] = NULL;
 }
 
