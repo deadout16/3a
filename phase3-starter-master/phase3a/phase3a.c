@@ -15,10 +15,12 @@
 P3_VmStats  P3_vmStats;
 
 int pageSize;
-
+int procTerminate;
 int lockId;
 int condId;
+int pagerCondId;
 int initCalled;
+int termPager;
 
 //TODO: What goes into the fault struct?
 typedef struct fault{
@@ -53,18 +55,31 @@ FaultHandler(int type, void *arg)
         P2_Terminate(P3_ACCESS_VIOLATION);
     }
     else{
+
+        //printf("else\n");
         rc = P1_Lock(lockId);
+        //printf("rc = %d\n",rc);
         assert(rc == P1_SUCCESS);
         newFault = (fault *)malloc(sizeof(fault));
         newFault->next = faultQueueHead->next;
         newFault->pid = P1_GetPid();
         newFault->page = (int) arg / pageSize;
         faultQueueHead->next = newFault;
-        rc = P1_Signal(condId);
+        printf("procId = %d\n",newFault->pid);
+        printf("page = %d\n",newFault->page);
+
+        rc = P1_Signal(pagerCondId);
         assert(rc == P1_SUCCESS);
         rc = P1_Wait(condId);
         assert(rc == P1_SUCCESS);
         // TODO: terminate if needed
+        if(procTerminate == 1){
+            procTerminate = 0;
+            rc = P2_Terminate(P3_OUT_OF_SWAP);
+            printf("rc = %d\n",rc);
+        }
+        rc = P1_Unlock(lockId);
+        assert(rc == P1_SUCCESS);
     }
 }
 
@@ -88,22 +103,32 @@ Pager(void *arg)
 
     *********************/
     fault *currFault;
-    USLOSS_PTE currPTE;
+    fault *tailFault;
+    //USLOSS_PTE currPTE;
     int currPage;
     int currPid;
     int frame;
     int rc;
+    
+
     while(1){
-        rc = P1_Wait(condId);
+        rc = P1_Lock(lockId);
         assert(rc == P1_SUCCESS);
+        rc = P1_Wait(pagerCondId);
+        if(termPager == 1){
+            break;
+        }
         // get fault from queue
         currFault = faultQueueHead;
         while(currFault->next != NULL){
+            printf("curr=%d\n",currFault->pid);
+            tailFault = currFault;
             currFault = currFault->next;
         }
+        printf("butthole---------------------------------->\n");
         currPid = currFault->pid;
         currPage = currFault->page;
-        currPTE = tables[currPid][currPage];
+        //currPTE = tables[currPid][currPage];
         // if process does not have page table
         if(tables[currPid] == NULL){
             printf("Process does not have a page table\n");
@@ -111,16 +136,29 @@ Pager(void *arg)
         }
         rc = P3PageFaultResolve(currPid, currPage, &frame);
         if(rc == P3_OUT_OF_SWAP){
+            printf("Out of swap\n");
             // TODO: send P3_OUT_OF_SWAP back to handler to terminate
+            procTerminate = 1;
         }
         else{
             if(rc == P3_NOT_IMPLEMENTED){
+                //printf("not implemented\n");
                 frame = currPage;    // NOTE: was page but page didnt exist
             }
-            currPTE.frame = frame;
-            currPTE.incore = 1;
+            tables[currPid][currPage].frame = frame;
+            tables[currPid][currPage].incore = 1;
+            P3_vmStats.freeFrames--;
+            //printf("freeFrames = %d\n",P3_vmStats.freeFrames);
         }
+        // remove from queue
+        tailFault->next = NULL;
+        printf("tail=%d\n",tailFault->pid);
+        tailFault = NULL;
+
         rc = P1_Signal(condId);
+        assert(rc == P1_SUCCESS);
+
+        rc = P1_Unlock(lockId);
         assert(rc == P1_SUCCESS);
     }
     return 0;
@@ -161,6 +199,8 @@ P3_VmInit(int unused, int pages, int frames, int pagers)
     assert(rc == P1_SUCCESS);
     rc = P1_CondCreate("condition", lockId, &condId);
     assert(rc == P1_SUCCESS);
+    rc = P1_CondCreate("pagerCondition", lockId, &pagerCondId);
+    assert(rc == P1_SUCCESS);
     // Set tables to NULL
     for(i = 0; i < P1_MAXPROC; i++){
         tables[i] = NULL;
@@ -192,13 +232,19 @@ P3_VmInit(int unused, int pages, int frames, int pagers)
 void
 P3_VmShutdown(void)
 {
-    int rc = 0;
+    int rc;
+    rc = P1_Lock(lockId);
+    assert(rc == P1_SUCCESS);
     // cause pager to quit and waits for it to do so
-    if(initCalled == 0){
+    if(initCalled == 1){
         rc = USLOSS_MmuDone();
-        while(rc == 0);                 // NOTE: Wait may not work
         P3_PrintStats(&P3_vmStats);
+        rc = P1_Signal(condId);
+        assert(rc == P1_SUCCESS);
+        termPager = 1;
     }
+    rc = P1_Unlock(lockId);
+    assert(rc == P1_SUCCESS);
 }
 
 USLOSS_PTE *
