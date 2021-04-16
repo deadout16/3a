@@ -39,7 +39,6 @@ FaultHandler(int type, void *arg)
     int rc;
     fault *newFault;
     /*******************
-
     if it's an access fault (USLOSS_MmuGetCause)
         terminate faulting process w/ P3_ACCESS_VIOLATION
     else
@@ -47,7 +46,6 @@ FaultHandler(int type, void *arg)
         let the pager know that there is a pending fault
         wait until the fault has been handled by the pager
         terminate the process if necessary
-
     *********************/
    // NOTE call P2_Terminate according to post @638
     if(USLOSS_MmuGetCause() == USLOSS_MMU_ACCESS){
@@ -78,6 +76,9 @@ FaultHandler(int type, void *arg)
             rc = P2_Terminate(P3_OUT_OF_SWAP);
             printf("rc = %d\n",rc);
         }
+        P3_vmStats.faults ++;
+        P3_vmStats.newPages ++;
+
         rc = P1_Unlock(lockId);
         assert(rc == P1_SUCCESS);
     }
@@ -87,7 +88,6 @@ static int
 Pager(void *arg)
 {
     /*******************
-
     loop until P3_VmShutdown is called
         wait for a fault
         if the process does not have a page table
@@ -100,7 +100,6 @@ Pager(void *arg)
                 frame = page
             update PTE in page table to map page to frame
        unblock faulting process
-
     *********************/
     fault *currFault;
     fault *tailFault;
@@ -116,6 +115,9 @@ Pager(void *arg)
         assert(rc == P1_SUCCESS);
         rc = P1_Wait(pagerCondId);
         if(termPager == 1){
+            printf("Done.\n");
+            rc = P1_Unlock(lockId);
+        assert(rc == P1_SUCCESS);
             break;
         }
         // get fault from queue
@@ -147,13 +149,16 @@ Pager(void *arg)
             }
             tables[currPid][currPage].frame = frame;
             tables[currPid][currPage].incore = 1;
-            P3_vmStats.freeFrames--;
+
+           
             //printf("freeFrames = %d\n",P3_vmStats.freeFrames);
         }
         // remove from queue
         tailFault->next = NULL;
         printf("tail=%d\n",tailFault->pid);
         tailFault = NULL;
+        printf("fram: %d incore: %d\n", tables[currPid][currPage].frame,
+            tables[currPid][currPage].incore );
 
         rc = P1_Signal(condId);
         assert(rc == P1_SUCCESS);
@@ -161,6 +166,7 @@ Pager(void *arg)
         rc = P1_Unlock(lockId);
         assert(rc == P1_SUCCESS);
     }
+
     return 0;
 }
 
@@ -232,19 +238,19 @@ P3_VmInit(int unused, int pages, int frames, int pagers)
 void
 P3_VmShutdown(void)
 {
-    int rc;
-    rc = P1_Lock(lockId);
-    assert(rc == P1_SUCCESS);
     // cause pager to quit and waits for it to do so
     if(initCalled == 1){
+        int rc;
+        rc = P1_Lock(lockId);
+        assert(rc == P1_SUCCESS);
         rc = USLOSS_MmuDone();
         P3_PrintStats(&P3_vmStats);
-        rc = P1_Signal(condId);
-        assert(rc == P1_SUCCESS);
         termPager = 1;
+        rc = P1_Signal(pagerCondId);
+        assert(rc == P1_SUCCESS);
+        rc = P1_Unlock(lockId);
+        assert(rc == P1_SUCCESS);
     }
-    rc = P1_Unlock(lockId);
-    assert(rc == P1_SUCCESS);
 }
 
 USLOSS_PTE *
@@ -280,12 +286,9 @@ void
 P3_FreePageTable(int pid)
 {
     // NOTE: added inits and getter
-    int numPages, numFrames, mode;
-    void *vmRegion;
-    void *pmAddr;
+
     int rc;
-    rc = USLOSS_MmuGetConfig(&vmRegion, &pmAddr, &pageSize, &numPages, &numFrames, &mode);
-    assert(rc == USLOSS_MMU_OK);
+
 
 
     USLOSS_PTE  *table = tables[pid];
@@ -343,4 +346,3 @@ P3_PrintStats(P3_VmStats *stats)
     USLOSS_Console("\tpageOuts:\t%d\n", stats->pageOuts);
     USLOSS_Console("\treplaced:\t%d\n", stats->replaced);
 }
-
